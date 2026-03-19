@@ -598,6 +598,139 @@ async def phase_teardown(count: int, env: dict) -> None:
     console.print("[green]VMs deleted.[/green]")
 
 
+# ─── Interactive Mode ─────────────────────────────────────────────────────────
+
+
+def interactive_menu(env: dict, count: int) -> None:
+    """Interactive menu: UI tunnel, custom task runner, or full E2E test."""
+    from rich.prompt import Prompt, Confirm
+
+    project = env.get("GCP_PROJECT", GCP_PROJECT)
+    zone = env.get("GCP_ZONE", GCP_ZONE)
+
+    console.print("\n[bold cyan]OpenClaw Fleet Tester — Interactive Mode[/bold cyan]")
+    console.print(f"  VMs: {', '.join(vm_name(i) for i in range(1, count + 1))}\n")
+
+    choices = {
+        "1": "Connect to OpenClaw UI (SSH tunnel to gateway)",
+        "2": "Run a single agent task",
+        "3": "Run all tasks (skip agents with existing memories)",
+        "4": "Run full end-to-end test",
+        "5": "Run verification only",
+        "6": "Teardown VMs",
+        "q": "Quit",
+    }
+
+    for k, v in choices.items():
+        console.print(f"  [{k}] {v}")
+
+    choice = Prompt.ask("\nChoice", choices=list(choices.keys()), default="q")
+
+    if choice == "1":
+        _interactive_ui_tunnel(env, count, project, zone)
+    elif choice == "2":
+        _interactive_single_task(env, count, project, zone)
+    elif choice == "3":
+        asyncio.run(phase_tasks(count, env))
+    elif choice == "4":
+        async def run_all():
+            for phase in PHASES_ORDERED[:-1]:  # skip teardown
+                await phase_fns_map()[phase](count, env)
+        asyncio.run(run_all())
+    elif choice == "5":
+        asyncio.run(phase_verify(count, env))
+    elif choice == "6":
+        asyncio.run(phase_teardown(count, env))
+
+
+def _interactive_ui_tunnel(env: dict, count: int, project: str, zone: str) -> None:
+    """Open SSH tunnel to the OpenClaw gateway on a chosen VM."""
+    from rich.prompt import Prompt
+
+    vm_choices = {str(i): vm_name(i) for i in range(1, count + 1)}
+    console.print("\n  Available VMs:")
+    for k, v in vm_choices.items():
+        console.print(f"    [{k}] {v}")
+
+    idx = Prompt.ask("  VM number", choices=list(vm_choices.keys()), default="1")
+    name = vm_choices[idx]
+    local_port = int(Prompt.ask("  Local port", default="18789"))
+    remote_port = 18789
+
+    console.print(f"\n  Opening SSH tunnel: localhost:{local_port} → {name}:{remote_port}")
+    console.print(f"  OpenClaw gateway will be available at [bold]ws://localhost:{local_port}[/bold]")
+    console.print(f"  Run [bold]openclaw tui[/bold] in another terminal to connect.")
+    console.print(f"  Press Ctrl+C to close the tunnel.\n")
+
+    tunnel_cmd = [
+        "gcloud", "compute", "ssh", name,
+        "--zone", zone, "--project", project,
+        "--quiet",
+        "--",
+        "-N",
+        "-L", f"{local_port}:localhost:{remote_port}",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30",
+    ]
+    try:
+        import subprocess
+        subprocess.run(tunnel_cmd)
+    except KeyboardInterrupt:
+        console.print("\n  Tunnel closed.")
+
+
+def _interactive_single_task(env: dict, count: int, project: str, zone: str) -> None:
+    """Let the user pick a VM, agent, and optionally override the task prompt."""
+    from rich.prompt import Prompt
+
+    # Build list of all (vm, fleet, agent) options
+    options = []
+    for vf in _VM_FLEETS:
+        if vf["vm_index"] > count:
+            continue
+        for agent_id in vf["agents"]:
+            options.append((vm_name(vf["vm_index"]), vf["fleet_id"], agent_id))
+
+    console.print("\n  Available agents:")
+    for i, (vm, fid, aid) in enumerate(options, 1):
+        default_task = TASKS.get(aid, "")[:60]
+        console.print(f"  [{i:2d}] {aid:<20} ({fid}) — {default_task}…")
+
+    idx = int(Prompt.ask("  Agent number", default="1")) - 1
+    if idx < 0 or idx >= len(options):
+        console.print("[red]Invalid choice.[/red]")
+        return
+
+    vm, fid, agent_id = options[idx]
+    default_prompt = TASKS.get(agent_id, "Recall your context and summarize your status.")
+    task_prompt = Prompt.ask("  Task prompt (Enter to use default)", default=default_prompt)
+
+    console.print(f"\n  Running: {agent_id} on {vm}")
+    console.print(f"  Prompt: {task_prompt[:80]}…\n")
+
+    inner = f"export TASK_PROMPT={shlex.quote(task_prompt)}; timeout 1800 openclaw agent --agent {agent_id} --message \"$TASK_PROMPT\" --timeout 1800"
+    rc, out, err = asyncio.run(run_async(
+        login_ssh_cmd(vm, inner, project, zone),
+        label=f"{agent_id}@{vm}",
+        timeout=1860,
+    ))
+    if rc != 0:
+        console.print(f"[yellow]Warning: rc={rc}[/yellow]")
+    console.print("[green]Done.[/green]")
+
+
+def phase_fns_map() -> dict:
+    return {
+        "provision": phase_provision,
+        "bootstrap": phase_bootstrap,
+        "plugin": phase_plugin,
+        "agents": phase_agents,
+        "tasks": phase_tasks,
+        "verify": phase_verify,
+        "teardown": phase_teardown,
+    }
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -619,9 +752,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--phase",
-        required=True,
+        required=False,
         choices=PHASES_ORDERED + ["all"],
-        help="Phase to run",
+        help="Phase to run (omit to launch interactive menu)",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Launch interactive menu (UI tunnel, task picker, full E2E)",
     )
     parser.add_argument(
         "--count",
@@ -653,24 +791,21 @@ def main() -> None:
     console.print(f"  Project: {env.get('GCP_PROJECT', GCP_PROJECT)}")
     console.print(f"  Zone:    {env.get('GCP_ZONE', GCP_ZONE)}")
     console.print(f"  VMs:     {count}")
+
+    # Interactive mode
+    if args.interactive or not args.phase:
+        interactive_menu(env, count)
+        return
+
     console.print(f"  Phase:   {args.phase}")
 
+    phase_fns = phase_fns_map()
     phases_to_run = PHASES_ORDERED if args.phase == "all" else [args.phase]
 
     # For teardown-only, don't provision
     if args.phase == "teardown":
         asyncio.run(phase_teardown(count, env))
         return
-
-    phase_fns = {
-        "provision": phase_provision,
-        "bootstrap": phase_bootstrap,
-        "plugin": phase_plugin,
-        "agents": phase_agents,
-        "tasks": phase_tasks,
-        "verify": phase_verify,
-        "teardown": phase_teardown,
-    }
 
     async def run_phases() -> None:
         for phase in phases_to_run:
