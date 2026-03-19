@@ -23,7 +23,8 @@ import httpx
 from rich.console import Console
 from rich.table import Table
 
-from config import TENANT, VM_FLEETS, MEMCLAW_API_URL
+import config
+from config import MEMCLAW_API_URL
 
 console = Console()
 
@@ -68,7 +69,14 @@ async def check_fleet_nodes(
         nodes = nodes.get("data", nodes.get("nodes", []))
 
     online_names = {n.get("node_name", "") for n in nodes if n.get("status") == "online"}
-    expected = {f"openclaw-test-vm-{i:02d}" for i in range(1, vm_count + 1)}
+    # Derive expected VM names from the same prefix used to build VM_FLEETS
+    # fleet_id pattern: {prefix}-fleet-01 → VM pattern: {prefix}-openclaw-vm-01
+    sample_fleet = config.VM_FLEETS[0]["fleet_id"] if config.VM_FLEETS else ""
+    # Extract prefix: "erni-fleet-01" → "erni", "test-fleet-01" → "test"
+    fleet_prefix = sample_fleet.rsplit("-fleet-", 1)[0] if "-fleet-" in sample_fleet else ""
+    vm_prefix = config.vm_name_prefix(fleet_prefix)
+    expected = {f"{vm_prefix}-{i:02d}" for i in range(1, vm_count + 1)}
+    missing = expected - online_names
     missing = expected - online_names
 
     if missing:
@@ -101,12 +109,12 @@ async def check_all_agents_registered(
     # Count expected agents across active VMs
     expected_count = sum(
         len(vf["agents"])
-        for vf in VM_FLEETS
+        for vf in config.VM_FLEETS
         if vf["vm_index"] <= vm_count
     )
     expected_agents = {
         agent_id
-        for vf in VM_FLEETS
+        for vf in config.VM_FLEETS
         if vf["vm_index"] <= vm_count
         for agent_id in vf["agents"]
     }
@@ -162,8 +170,9 @@ async def check_fleet_isolation(
     client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
 ) -> Result:
     """Assert fleet-02 search returns only fleet-02 memories (no cross-fleet leakage)."""
-    name = "Fleet isolation (test-fleet-02)"
-    fleet_id = "test-fleet-02"
+    # Use the second fleet from config.VM_FLEETS for isolation check
+    fleet_id = config.VM_FLEETS[1]["fleet_id"] if len(config.VM_FLEETS) > 1 else "fleet-02"
+    name = f"Fleet isolation ({fleet_id})"
     try:
         resp = await client.post(
             f"{url}/api/search",
@@ -200,7 +209,7 @@ async def check_agent_scoped_memories(
             params={
                 "tenant_id": tenant_id,
                 "agent_id": "nexus",
-                "fleet_id": "test-fleet-01",
+                "fleet_id": config.VM_FLEETS[0]["fleet_id"],
             },
             headers={"X-API-Key": api_key},
         )
@@ -355,7 +364,7 @@ async def run_verification(
         )
 
         # Per-fleet memory checks (only for VMs that were provisioned)
-        for vf in VM_FLEETS:
+        for vf in config.VM_FLEETS:
             if vf["vm_index"] <= vm_count:
                 results.append(
                     await check_memories_per_fleet(client, url, api_key, tenant_id, vf["fleet_id"])
@@ -414,7 +423,7 @@ def main() -> None:
     parser.add_argument("--url", default=None, help=f"MemClaw API URL (default: {MEMCLAW_API_URL})")
     parser.add_argument("--api-key", default=None, help="MemClaw tenant API key")
     parser.add_argument("--admin-key", default=None, help="MemClaw admin key (for privileged checks)")
-    parser.add_argument("--tenant-id", default=TENANT, help=f"Tenant ID (default: {TENANT})")
+    parser.add_argument("--tenant-id", default=config.TENANT, help=f"Tenant ID (default: {config.TENANT})")
     parser.add_argument(
         "--count",
         type=int,
@@ -441,6 +450,18 @@ def main() -> None:
     if not api_key:
         console.print("[red]Error: MEMCLAW_API_KEY required (--api-key or .env)[/red]")
         sys.exit(1)
+
+    # Auto-resolve tenant from API key if not explicitly set
+    if args.tenant_id == config.TENANT and api_key:
+        from orchestrate import resolve_tenant
+        resolved = resolve_tenant(api_key)
+        if resolved:
+            config.TENANT = resolved
+            args.tenant_id = resolved
+
+    # Init naming from TESTER_PREFIX
+    user_prefix = env.get("TESTER_PREFIX", "")
+    config.VM_FLEETS = config.make_vm_fleets(user_prefix)
 
     if not admin_key:
         console.print("[yellow]Warning: MEMCLAW_ADMIN_KEY not set — privileged checks will use API key[/yellow]")
