@@ -29,8 +29,8 @@ import httpx
 from rich.console import Console
 from rich.table import Table
 
+import config
 from config import (
-    TENANT,
     GCP_PROJECT,
     GCP_ZONE,
     MEMCLAW_API_URL,
@@ -56,6 +56,23 @@ def _init_naming(user_prefix: str) -> None:
     _VM_FLEETS = make_vm_fleets(user_prefix)
 
 # ─── Environment ──────────────────────────────────────────────────────────────
+
+
+def resolve_tenant(api_key: str) -> str | None:
+    """Auto-resolve tenant_id from the MemClaw API key via install-plugin endpoint."""
+    try:
+        resp = httpx.get(
+            f"{MEMCLAW_API_URL}/api/install-plugin",
+            params={"api_key": api_key, "fleet_id": "probe", "api_url": MEMCLAW_API_URL},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            for line in resp.text.splitlines():
+                if line.startswith("MEMCLAW_TENANT_ID="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return None
 
 
 def load_env() -> dict[str, str]:
@@ -344,7 +361,7 @@ async def _verify_node_online(vm: str, fleet_id: str, api_key: str, timeout: int
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     f"{MEMCLAW_API_URL}/api/fleet/nodes",
-                    params={"tenant_id": TENANT},
+                    params={"tenant_id": config.TENANT},
                     headers={"X-API-Key": api_key},
                 )
             if resp.status_code == 200:
@@ -385,7 +402,7 @@ async def phase_agents(count: int, env: dict) -> None:
             for agent_id in agent_ids:
                 ws_dir = ws_root / agent_id
                 ws_dir.mkdir()
-                files = build_workspace_files(agent_id, fleet_id, TENANT)
+                files = build_workspace_files(agent_id, fleet_id, config.TENANT)
                 for fname, content in files.items():
                     (ws_dir / fname).write_text(content, encoding="utf-8")
 
@@ -412,6 +429,18 @@ async def phase_agents(count: int, env: dict) -> None:
                 sys.exit(1)
 
         console.print(f"  [green]{name}: {len(agent_ids)} workspaces deployed[/green]")
+
+        # Restart gateway so it picks up the new workspace files (not cached from prior run)
+        systemd_restart = (
+            "systemctl --user restart openclaw-gateway.service 2>/dev/null || "
+            "export PATH=$HOME/.npm-global/bin:$PATH; "
+            "timeout 15 openclaw gateway restart || true"
+        )
+        await run_async(
+            ssh_cmd(name, systemd_restart, project, zone),
+            label=f"restart:{name}",
+            timeout=30,
+        )
 
         # Register each agent individually with a per-command timeout
         # (openclaw agents add can hang if gateway is slow to respond)
@@ -465,7 +494,7 @@ async def phase_tasks(count: int, env: dict) -> None:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     f"{MEMCLAW_API_URL}/api/memories",
-                    params={"tenant_id": TENANT, "limit": 500},
+                    params={"tenant_id": config.TENANT, "limit": 500},
                     headers={"X-API-Key": api_key},
                 )
             if resp.status_code == 200:
@@ -516,7 +545,7 @@ async def phase_tasks(count: int, env: dict) -> None:
                 async with httpx.AsyncClient(timeout=15) as client:
                     resp = await client.patch(
                         f"{MEMCLAW_API_URL}/api/agents/nexus/trust",
-                        params={"tenant_id": TENANT},
+                        params={"tenant_id": config.TENANT},
                         json={"trust_level": 2},
                         headers={"X-API-Key": auth_key},
                     )
@@ -557,7 +586,7 @@ async def phase_verify(count: int, env: dict) -> None:
         url=MEMCLAW_API_URL,
         api_key=api_key,
         admin_key=admin_key,
-        tenant_id=TENANT,
+        tenant_id=config.TENANT,
         vm_count=count,
     )
 
@@ -771,6 +800,16 @@ def main() -> None:
 
     env = load_env()
 
+    # Auto-resolve tenant_id from the API key
+    api_key = env.get("MEMCLAW_API_KEY", "")
+    if api_key:
+        resolved = resolve_tenant(api_key)
+        if resolved:
+            config.TENANT = resolved
+            console.print(f"  [dim]Resolved tenant: {resolved}[/dim]")
+        else:
+            console.print("[yellow]Warning: could not resolve tenant from API key — using default[/yellow]")
+
     # Initialize VM naming based on user prefix
     user_prefix = env.get("TESTER_PREFIX", "")
     _init_naming(user_prefix)
@@ -785,7 +824,7 @@ def main() -> None:
         sys.exit(1)
 
     console.print(f"\n[bold cyan]OpenClaw Fleet Memory Test[/bold cyan]")
-    console.print(f"  Tenant:  {TENANT}")
+    console.print(f"  Tenant:  {config.TENANT}")
     console.print(f"  Prefix:  {user_prefix or '(none)'}")
     console.print(f"  VM name: {vm_name(1)} … {vm_name(count)}")
     console.print(f"  Project: {env.get('GCP_PROJECT', GCP_PROJECT)}")
