@@ -7,21 +7,41 @@ from __future__ import annotations
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-TENANT = "ernitest2"
-VM_NAME_PREFIX = "openclaw-test-vm"
+TENANT = "ernitest2"        # auto-resolved from API key; override via .env MEMCLAW_TENANT_ID
 GCP_PROJECT = "alpine-theory-469016-c8"
 GCP_ZONE = "us-central1-a"
 MEMCLAW_API_URL = "https://memclaw.net"
 VM_COUNT_DEFAULT = 3
 
-# ─── VM → Fleet Mapping ───────────────────────────────────────────────────────
-# Index 0 = vm-01, index 1 = vm-02, index 2 = vm-03
 
-VM_FLEETS = [
-    {
-        "vm_index": 1,
-        "fleet_id": "test-fleet-01",
-        "agents": [
+def vm_name_prefix(user_prefix: str) -> str:
+    """Return the VM name prefix for a given user prefix.
+
+    Example: user_prefix='erni' → 'erni-openclaw-vm'
+    Falls back to 'openclaw-vm' if no prefix supplied.
+    """
+    if user_prefix:
+        return f"{user_prefix}-openclaw-vm"
+    return "openclaw-vm"
+
+
+def fleet_id(user_prefix: str, index: int) -> str:
+    """Return the fleet ID for VM index (1-based).
+
+    Example: user_prefix='erni', index=1 → 'erni-fleet-01'
+    """
+    if user_prefix:
+        return f"{user_prefix}-fleet-{index:02d}"
+    return f"fleet-{index:02d}"
+
+
+def make_vm_fleets(user_prefix: str) -> list[dict]:
+    """Build the VM_FLEETS list for a given user prefix."""
+    return [
+        {
+            "vm_index": 1,
+            "fleet_id": fleet_id(user_prefix, 1),
+            "agents": [
             "nexus",
             "ai-assistant",
             "eng-architect",
@@ -30,33 +50,37 @@ VM_FLEETS = [
             "legal",
             "home-assistant",
             "customer-success",
-        ],
-    },
-    {
-        "vm_index": 2,
-        "fleet_id": "test-fleet-02",
-        "agents": [
-            "operations",
-            "qa-engineer",
-            "algotrader",
-            "marketing",
-            "legal",
-            "finance",
-            "eng-architect",
-        ],
-    },
-    {
-        "vm_index": 3,
-        "fleet_id": "test-fleet-03",
-        "agents": [
-            "ai-assistant",
-            "qa-engineer",
-            "home-assistant",
-            "customer-success",
-            "algotrader",
-        ],
-    },
-]
+            ],
+        },
+        {
+            "vm_index": 2,
+            "fleet_id": fleet_id(user_prefix, 2),
+            "agents": [
+                "operations",
+                "qa-engineer",
+                "algotrader",
+                "marketing",
+                "legal",
+                "finance",
+                "eng-architect",
+            ],
+        },
+        {
+            "vm_index": 3,
+            "fleet_id": fleet_id(user_prefix, 3),
+            "agents": [
+                "ai-assistant",
+                "qa-engineer",
+                "home-assistant",
+                "customer-success",
+                "algotrader",
+            ],
+        },
+    ]
+
+
+# Default VM_FLEETS (no prefix) — overridden at runtime by orchestrate.py
+VM_FLEETS = make_vm_fleets("")
 
 # ─── Agent Definitions ────────────────────────────────────────────────────────
 

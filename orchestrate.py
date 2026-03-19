@@ -31,19 +31,29 @@ from rich.table import Table
 
 from config import (
     TENANT,
-    VM_NAME_PREFIX,
     GCP_PROJECT,
     GCP_ZONE,
     MEMCLAW_API_URL,
     VM_COUNT_DEFAULT,
-    VM_FLEETS,
     TASKS,
     build_workspace_files,
+    vm_name_prefix,
+    make_vm_fleets,
 )
 
 console = Console()
 
 PHASES_ORDERED = ["provision", "bootstrap", "plugin", "agents", "tasks", "verify", "teardown"]
+
+# Runtime-resolved from env — set in main() before any phase runs
+_VM_NAME_PREFIX: str = "openclaw-vm"
+_VM_FLEETS: list[dict] = []
+
+
+def _init_naming(user_prefix: str) -> None:
+    global _VM_NAME_PREFIX, _VM_FLEETS
+    _VM_NAME_PREFIX = vm_name_prefix(user_prefix)
+    _VM_FLEETS = make_vm_fleets(user_prefix)
 
 # ─── Environment ──────────────────────────────────────────────────────────────
 
@@ -70,15 +80,7 @@ def load_env() -> dict[str, str]:
 
 
 def vm_name(index: int) -> str:
-    return f"{VM_NAME_PREFIX}-{index:02d}"
-
-
-def fleet_for_vm(index: int) -> dict | None:
-    """Return VM_FLEETS entry for a 1-based VM index, or None if out of range."""
-    for vf in VM_FLEETS:
-        if vf["vm_index"] == index:
-            return vf
-    return None
+    return f"{_VM_NAME_PREFIX}-{index:02d}"
 
 
 # ─── Subprocess Helpers ───────────────────────────────────────────────────────
@@ -328,7 +330,7 @@ async def phase_plugin(count: int, env: dict) -> None:
         # Verify node appears in fleet within 60s
         await _verify_node_online(name, fleet_id, api_key)
 
-    for vf in VM_FLEETS:
+    for vf in _VM_FLEETS:
         await install_on_vm(vf)
 
     console.print("[green]MemClaw plugin installed on all VMs.[/green]")
@@ -427,7 +429,7 @@ async def phase_agents(count: int, env: dict) -> None:
             registered += 1
         console.print(f"  [green]{name}: {registered}/{len(agent_ids)} agents registered[/green]")
 
-    await asyncio.gather(*[provision_vm(vf) for vf in VM_FLEETS])
+    await asyncio.gather(*[provision_vm(vf) for vf in _VM_FLEETS])
     console.print("[green]Agent workspaces provisioned on all VMs.[/green]")
 
 
@@ -475,7 +477,7 @@ async def phase_tasks(count: int, env: dict) -> None:
     # Step 1: Run all non-nexus agents in parallel (by fleet), skip already done
     console.print("\n  [dim]Running non-nexus agents across all fleets...[/dim]")
     non_nexus_coros = []
-    for vf in VM_FLEETS:
+    for vf in _VM_FLEETS:
         idx = vf["vm_index"]
         if idx > count:
             continue
@@ -495,7 +497,7 @@ async def phase_tasks(count: int, env: dict) -> None:
         console.print("  [dim]All non-nexus agents already wrote memories.[/dim]")
 
     # Step 2: Bootstrap nexus (registers it in MemClaw on first write)
-    nexus_vm_entry = next((vf for vf in VM_FLEETS if "nexus" in vf["agents"]), None)
+    nexus_vm_entry = next((vf for vf in _VM_FLEETS if "nexus" in vf["agents"]), None)
     if nexus_vm_entry and nexus_vm_entry["vm_index"] <= count:
         nexus_vm = vm_name(nexus_vm_entry["vm_index"])
         console.print("\n  [dim]Registering NEXUS agent...[/dim]")
@@ -630,6 +632,10 @@ def main() -> None:
 
     env = load_env()
 
+    # Initialize VM naming based on user prefix
+    user_prefix = env.get("TESTER_PREFIX", "")
+    _init_naming(user_prefix)
+
     if args.count is not None:
         count = args.count
     else:
@@ -641,6 +647,8 @@ def main() -> None:
 
     console.print(f"\n[bold cyan]OpenClaw Fleet Memory Test[/bold cyan]")
     console.print(f"  Tenant:  {TENANT}")
+    console.print(f"  Prefix:  {user_prefix or '(none)'}")
+    console.print(f"  VM name: {vm_name(1)} … {vm_name(count)}")
     console.print(f"  Project: {env.get('GCP_PROJECT', GCP_PROJECT)}")
     console.print(f"  Zone:    {env.get('GCP_ZONE', GCP_ZONE)}")
     console.print(f"  VMs:     {count}")

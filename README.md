@@ -75,6 +75,7 @@ python orchestrate.py --phase teardown
 | `GCP_PROJECT` | ✅ | GCP project ID |
 | `GCP_ZONE` | optional | Default: `us-central1-a` |
 | `VM_COUNT` | optional | Default: `3` (max: 10, but fleet defs cover 3) |
+| `TESTER_PREFIX` | ✅ multi-user | Your name/handle — scopes VM names and fleet IDs so multiple team members can run simultaneously without collision. Example: `alice` → `alice-openclaw-vm-01`, `alice-fleet-01` |
 
 See `.env.example` for a ready-to-copy template.
 
