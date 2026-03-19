@@ -18,21 +18,22 @@ def vm_name_prefix(user_prefix: str) -> str:
     """Return the VM name prefix for a given user prefix.
 
     Example: user_prefix='erni' → 'erni-openclaw-vm'
-    Falls back to 'openclaw-vm' if no prefix supplied.
+    Falls back to 'openclaw-test-vm' if no prefix supplied (default/solo mode).
     """
     if user_prefix:
         return f"{user_prefix}-openclaw-vm"
-    return "openclaw-vm"
+    return "openclaw-test-vm"
 
 
 def fleet_id(user_prefix: str, index: int) -> str:
     """Return the fleet ID for VM index (1-based).
 
     Example: user_prefix='erni', index=1 → 'erni-fleet-01'
+    Falls back to 'test-fleet-{NN}' if no prefix supplied (default/solo mode).
     """
     if user_prefix:
         return f"{user_prefix}-fleet-{index:02d}"
-    return f"fleet-{index:02d}"
+    return f"test-fleet-{index:02d}"
 
 
 def make_vm_fleets(user_prefix: str) -> list[dict]:

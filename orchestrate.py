@@ -448,7 +448,8 @@ async def phase_tasks(count: int, env: dict) -> None:
         console.print(f"  Running task: {name} / {agent_id}")
         # timeout 600: kills openclaw on the remote side after 10 min so SSH closes cleanly
         # Pass prompt via env var to avoid shell quoting complexity
-        inner = f"export TASK_PROMPT={shlex.quote(task_prompt)}; timeout 1800 openclaw agent --agent {agent_id} --message \"$TASK_PROMPT\""
+        # --timeout 1800 overrides openclaw's own 600s default; outer timeout 1800 kills the shell
+        inner = f"export TASK_PROMPT={shlex.quote(task_prompt)}; timeout 1800 openclaw agent --agent {agent_id} --message \"$TASK_PROMPT\" --timeout 1800"
         rc, _, err = await run_async(
             login_ssh_cmd(name, inner, project, zone),
             label=f"{agent_id}@{name}",
