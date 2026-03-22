@@ -14,6 +14,8 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 
+from config import TENANT as _DEFAULT_TENANT
+
 console = Console()
 
 # Load .env
@@ -25,7 +27,6 @@ for line in env_path.read_text().splitlines():
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 API_KEY = os.environ["MEMCLAW_API_KEY"]
-TENANT = "ernitest3"  # will be resolved
 PROJECT = os.environ.get("GCP_PROJECT", "alpine-theory-469016-c8")
 ZONE = os.environ.get("GCP_ZONE", "us-central1-a")
 PREFIX = os.environ.get("TESTER_PREFIX", "erni")
@@ -342,19 +343,17 @@ async def run_cmd(cmd: list[str], label: str, timeout: int = 1860) -> int:
     return rc
 
 
-async def get_existing_pairs() -> set[tuple[str, str]]:
-    """Return (fleet_id, agent_id) pairs that already have memories."""
-    # Resolve tenant
+def _resolve_tenant() -> str:
     from orchestrate import resolve_tenant
-    global TENANT
-    resolved = resolve_tenant(API_KEY)
-    if resolved:
-        TENANT = resolved
+    return resolve_tenant(API_KEY) or _DEFAULT_TENANT
 
+
+async def get_existing_pairs(tenant: str) -> set[tuple[str, str]]:
+    """Return (fleet_id, agent_id) pairs that already have memories."""
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             "https://memclaw.net/api/memories",
-            params={"tenant_id": TENANT, "limit": 1000},
+            params={"tenant_id": tenant, "limit": 1000},
             headers={"X-API-Key": API_KEY},
         )
     mems = resp.json() if isinstance(resp.json(), list) else []
@@ -362,9 +361,10 @@ async def get_existing_pairs() -> set[tuple[str, str]]:
 
 
 async def main():
-    existing = await get_existing_pairs()
+    tenant = _resolve_tenant()
+    existing = await get_existing_pairs(tenant)
     console.print(f"[bold cyan]Sequential Agent Runner v2[/bold cyan]")
-    console.print(f"  Tenant: {TENANT}")
+    console.print(f"  Tenant: {tenant}")
     console.print(f"  Existing (fleet, agent) pairs: {len(existing)}")
 
     total_run = 0
@@ -414,7 +414,7 @@ async def main():
             fleet = f"{PREFIX}-fleet-{i:02d}"
             resp = await client.get(
                 "https://memclaw.net/api/memories",
-                params={"tenant_id": TENANT, "fleet_id": fleet, "limit": 500},
+                params={"tenant_id": tenant, "fleet_id": fleet, "limit": 500},
                 headers={"X-API-Key": API_KEY},
             )
             mems = resp.json() if isinstance(resp.json(), list) else []

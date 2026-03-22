@@ -10,6 +10,8 @@ from pathlib import Path
 import httpx
 from rich.console import Console
 
+from config import TENANT
+
 console = Console()
 
 for line in Path(__file__).parent.joinpath(".env").read_text().splitlines():
@@ -178,7 +180,7 @@ async def run_one(vm_name: str, agent_id: str, prompt: str) -> int:
 async def main():
     # Resolve tenant
     from orchestrate import resolve_tenant
-    tenant = resolve_tenant(API_KEY) or "ernitest3"
+    tenant = resolve_tenant(API_KEY) or TENANT
 
     # Check what already exists
     async with httpx.AsyncClient(timeout=15) as c:
