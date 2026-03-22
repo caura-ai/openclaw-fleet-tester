@@ -260,6 +260,41 @@ async def check_cross_fleet_recall(
     return Result(name, True, f"Recall returned {len(str(summary))} chars of context")
 
 
+async def check_trust_level_denied(
+    client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
+) -> Result:
+    """Assert a trust-level-1 agent is denied org-wide (cross-fleet) recall."""
+    agent = config.TRUST_DENIED_AGENT
+    name = f"Trust level denied ({agent})"
+    try:
+        resp = await client.post(
+            f"{url}/api/recall",
+            json={
+                "tenant_id": tenant_id,
+                "agent_id": agent,
+                "query": "all active tasks across all fleets",
+            },
+            headers={"X-API-Key": api_key},
+        )
+    except Exception as exc:
+        return Result(name, False, f"Request failed: {exc}")
+
+    if resp.status_code == 403:
+        return Result(name, True, f"403 returned — {agent} correctly denied cross-fleet recall")
+
+    if resp.status_code != 200:
+        return Result(name, False, f"Unexpected HTTP {resp.status_code}: {resp.text[:200]}")
+
+    # API returned 200 — check if it actually returned memories
+    data = resp.json()
+    memory_count = data.get("memory_count", len(data.get("memories", [])))
+    if memory_count == 0:
+        return Result(name, True, f"200 but 0 memories — {agent} effectively denied cross-fleet recall")
+
+    summary = data.get("summary", "")
+    return Result(name, False, f"Trust breach: {agent} (trust level 1) got {memory_count} cross-fleet memories: {str(summary)[:200]}")
+
+
 async def check_procedure_memories(
     client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
 ) -> Result:
@@ -470,6 +505,9 @@ async def run_verification(
         )
         results.append(
             await check_cross_fleet_recall(client, url, api_key, tenant_id)
+        )
+        results.append(
+            await check_trust_level_denied(client, url, api_key, tenant_id)
         )
         results.append(
             await check_procedure_memories(client, url, api_key, tenant_id)
