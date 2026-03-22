@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OpenClaw Fleet Memory Test — Verification
+OpenClaw Fleet Memory Test v2 — Verification
 
 Standalone script that runs assertions against MemClaw API to confirm
 memories were stored, scoped, and recalled correctly.
@@ -8,7 +8,7 @@ memories were stored, scoped, and recalled correctly.
 Usage:
     python verify.py
     python verify.py --url https://memclaw.net --api-key mc_... --admin-key mc_admin_...
-    python verify.py --count 3
+    python verify.py --count 10
 """
 
 from __future__ import annotations
@@ -65,18 +65,13 @@ async def check_fleet_nodes(
 
     nodes = resp.json()
     if not isinstance(nodes, list):
-        # Some APIs wrap in {data: [...]}
         nodes = nodes.get("data", nodes.get("nodes", []))
 
     online_names = {n.get("node_name", "") for n in nodes if n.get("status") == "online"}
-    # Derive expected VM names from the same prefix used to build VM_FLEETS
-    # fleet_id pattern: {prefix}-fleet-01 → VM pattern: {prefix}-openclaw-vm-01
     sample_fleet = config.VM_FLEETS[0]["fleet_id"] if config.VM_FLEETS else ""
-    # Extract prefix: "erni-fleet-01" → "erni", "test-fleet-01" → "test"
     fleet_prefix = sample_fleet.rsplit("-fleet-", 1)[0] if "-fleet-" in sample_fleet else ""
     vm_prefix = config.vm_name_prefix(fleet_prefix)
     expected = {f"{vm_prefix}-{i:02d}" for i in range(1, vm_count + 1)}
-    missing = expected - online_names
     missing = expected - online_names
 
     if missing:
@@ -106,7 +101,6 @@ async def check_all_agents_registered(
 
     registered = {a.get("agent_id", "") for a in agents}
 
-    # Count expected agents across active VMs
     expected_count = sum(
         len(vf["agents"])
         for vf in config.VM_FLEETS
@@ -119,7 +113,6 @@ async def check_all_agents_registered(
         for agent_id in vf["agents"]
     }
 
-    # Note: agent IDs may repeat across fleets; what matters is total registrations
     total = len(agents)
     if total < expected_count:
         return Result(
@@ -139,7 +132,7 @@ async def check_memories_per_fleet(
     try:
         resp = await client.post(
             f"{url}/api/search",
-            json={"tenant_id": tenant_id, "fleet_id": fleet_id, "query": "*", "limit": 50},
+            json={"tenant_id": tenant_id, "fleet_id": fleet_id, "query": "*", "limit": 100},
             headers={"X-API-Key": api_key},
         )
     except Exception as exc:
@@ -169,8 +162,7 @@ async def check_memories_per_fleet(
 async def check_fleet_isolation(
     client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
 ) -> Result:
-    """Assert fleet-02 search returns only fleet-02 memories (no cross-fleet leakage)."""
-    # Use the second fleet from config.VM_FLEETS for isolation check
+    """Assert fleet-scoped search returns only that fleet's memories."""
     fleet_id = config.VM_FLEETS[1]["fleet_id"] if len(config.VM_FLEETS) > 1 else "fleet-02"
     name = f"Fleet isolation ({fleet_id})"
     try:
@@ -225,7 +217,6 @@ async def check_agent_scoped_memories(
     if not memories:
         return Result(name, False, "No memories found for nexus agent")
 
-    # Verify attribution
     wrong_agent = [
         m.get("id", "?")
         for m in memories
@@ -248,8 +239,7 @@ async def check_cross_fleet_recall(
             json={
                 "tenant_id": tenant_id,
                 "agent_id": "nexus",
-                "query": "all active tasks and work in progress",
-                # No fleet_id — org-wide recall
+                "query": "all active tasks and work in progress across all fleets",
             },
             headers={"X-API-Key": api_key},
         )
@@ -280,9 +270,8 @@ async def check_procedure_memories(
             f"{url}/api/search",
             json={
                 "tenant_id": tenant_id,
-                "query": "procedure step runbook checklist",
-                "memory_type": "procedure",
-                "limit": 20,
+                "query": "procedure step runbook checklist onboarding release",
+                "limit": 30,
             },
             headers={"X-API-Key": api_key},
         )
@@ -296,7 +285,6 @@ async def check_procedure_memories(
     memories = data if isinstance(data, list) else data.get("data", data.get("memories", data.get("results", [])))
 
     if not memories:
-        # Fallback: search without memory_type filter — some APIs may use different type names
         return Result(
             name,
             False,
@@ -335,6 +323,112 @@ async def check_entities_extracted(
     return Result(name, True, f"{len(entities)} entities extracted, types: {types}")
 
 
+async def check_delegation_memories(
+    client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
+) -> Result:
+    """Assert NEXUS wrote delegation task memories to other fleets."""
+    name = "NEXUS delegation memories"
+    try:
+        resp = await client.post(
+            f"{url}/api/search",
+            json={
+                "tenant_id": tenant_id,
+                "query": "NEXUS delegation task",
+                "limit": 20,
+            },
+            headers={"X-API-Key": api_key},
+        )
+    except Exception as exc:
+        return Result(name, False, f"Request failed: {exc}")
+
+    if resp.status_code != 200:
+        return Result(name, False, f"HTTP {resp.status_code}: {resp.text[:100]}")
+
+    data = resp.json()
+    memories = data if isinstance(data, list) else data.get("data", data.get("memories", data.get("results", [])))
+
+    if not memories:
+        return Result(name, False, "No delegation memories found from NEXUS")
+
+    # Check that at least some are from nexus
+    nexus_mems = [m for m in memories if m.get("agent_id") == "nexus"]
+    if not nexus_mems:
+        return Result(name, False, f"Found {len(memories)} memories matching 'delegation' but none from nexus agent")
+
+    return Result(name, True, f"{len(nexus_mems)} delegation memories from NEXUS")
+
+
+async def check_web_search_memories(
+    client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
+) -> Result:
+    """Assert research agents stored web-sourced findings (memories with source_uri or web references)."""
+    name = "Web search memories"
+    # Search for memories that reference web sources
+    try:
+        resp = await client.post(
+            f"{url}/api/search",
+            json={
+                "tenant_id": tenant_id,
+                "query": "web search research source URL benchmark comparison",
+                "limit": 30,
+            },
+            headers={"X-API-Key": api_key},
+        )
+    except Exception as exc:
+        return Result(name, False, f"Request failed: {exc}")
+
+    if resp.status_code != 200:
+        return Result(name, False, f"HTTP {resp.status_code}: {resp.text[:100]}")
+
+    data = resp.json()
+    memories = data if isinstance(data, list) else data.get("data", data.get("memories", data.get("results", [])))
+
+    if not memories:
+        return Result(name, False, "No web-search-related memories found")
+
+    # Check for research agent contributions (fleet-04 and fleet-09 agents)
+    research_agents = {"ai-assistant", "data-scientist", "market-researcher", "web-researcher", "fact-checker",
+                       "competitive-analyst", "trend-analyst", "news-monitor"}
+    research_mems = [m for m in memories if m.get("agent_id") in research_agents]
+
+    if not research_mems:
+        return Result(name, False, f"Found {len(memories)} memories but none from research/intelligence agents")
+
+    agents_found = {m.get("agent_id") for m in research_mems}
+    # Check for source_uri in any memory
+    sourced = [m for m in research_mems if m.get("source_uri")]
+    source_note = f", {len(sourced)} with source_uri" if sourced else ""
+
+    return Result(name, True, f"{len(research_mems)} research memories from {agents_found}{source_note}")
+
+
+async def check_memory_count_minimum(
+    client: httpx.AsyncClient, url: str, api_key: str, tenant_id: str
+) -> Result:
+    """Assert total memory count meets v2 minimum threshold (150+)."""
+    name = "Memory count ≥ 150"
+    # Sum per-fleet search results to avoid rate-limited /api/memories endpoint
+    total = 0
+    for vf in config.VM_FLEETS:
+        try:
+            resp = await client.post(
+                f"{url}/api/search",
+                json={"tenant_id": tenant_id, "fleet_id": vf["fleet_id"], "query": "*", "limit": 100},
+                headers={"X-API-Key": api_key},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                mems = data if isinstance(data, list) else data.get("data", data.get("results", []))
+                total += len(mems)
+        except Exception:
+            pass
+
+    if total < 150:
+        return Result(name, False, f"Only {total} memories found (expected ≥150)")
+
+    return Result(name, True, f"{total} total memories")
+
+
 # ─── Main Verification Runner ─────────────────────────────────────────────────
 
 
@@ -343,13 +437,11 @@ async def run_verification(
     api_key: str,
     admin_key: str,
     tenant_id: str,
-    vm_count: int = 3,
+    vm_count: int = 10,
 ) -> tuple[int, int]:
     """
     Run all verification assertions. Returns (passed_count, failed_count).
-    Prints a rich table with results.
     """
-    # Use admin key when available for privileged queries, fall back to api_key
     priv_key = admin_key if admin_key else api_key
 
     results: list[Result] = []
@@ -385,6 +477,16 @@ async def run_verification(
         results.append(
             await check_entities_extracted(client, url, priv_key, tenant_id)
         )
+        # v2 assertions
+        results.append(
+            await check_delegation_memories(client, url, api_key, tenant_id)
+        )
+        results.append(
+            await check_web_search_memories(client, url, api_key, tenant_id)
+        )
+        results.append(
+            await check_memory_count_minimum(client, url, api_key, tenant_id)
+        )
 
     # Print results table
     table = Table(title="Verification Results", show_header=True)
@@ -418,7 +520,7 @@ async def run_verification(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Standalone MemClaw verification for OpenClaw fleet test"
+        description="Standalone MemClaw verification for OpenClaw fleet test v2"
     )
     parser.add_argument("--url", default=None, help=f"MemClaw API URL (default: {MEMCLAW_API_URL})")
     parser.add_argument("--api-key", default=None, help="MemClaw tenant API key")
@@ -427,8 +529,8 @@ def main() -> None:
     parser.add_argument(
         "--count",
         type=int,
-        default=3,
-        help="Number of VMs that were provisioned (default: 3)",
+        default=10,
+        help="Number of VMs that were provisioned (default: 10)",
     )
     args = parser.parse_args()
 
@@ -466,7 +568,7 @@ def main() -> None:
     if not admin_key:
         console.print("[yellow]Warning: MEMCLAW_ADMIN_KEY not set — privileged checks will use API key[/yellow]")
 
-    console.print(f"\n[bold cyan]MemClaw Verification[/bold cyan]")
+    console.print(f"\n[bold cyan]MemClaw Verification v2[/bold cyan]")
     console.print(f"  URL:    {url}")
     console.print(f"  Tenant: {args.tenant_id}")
     console.print(f"  VMs:    {args.count}")

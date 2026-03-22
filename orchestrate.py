@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-OpenClaw Fleet Memory Test — Orchestrator
+OpenClaw Fleet Memory Test v2 — Orchestrator
 
 Usage:
-    python orchestrate.py --phase all --count 3
-    python orchestrate.py --phase provision --count 3
+    python orchestrate.py --phase all --count 10
+    python orchestrate.py --phase provision --count 10
     python orchestrate.py --phase bootstrap
     python orchestrate.py --phase plugin
     python orchestrate.py --phase agents
@@ -164,12 +164,7 @@ def ssh_cmd(
 
 
 def login_ssh_cmd(name: str, command: str, project: str, zone: str) -> list[str]:
-    """SSH command that prepends openclaw's install location to PATH.
-
-    The openclaw installer puts the binary in ~/.npm-global/bin/ and adds it
-    to ~/.bashrc. But ~/.bashrc is skipped in non-interactive SSH sessions.
-    We prepend the path explicitly instead.
-    """
+    """SSH command that prepends openclaw's install location to PATH."""
     wrapped = f"export PATH=$HOME/.npm-global/bin:$PATH; {command}"
     return ssh_cmd(name, wrapped, project, zone)
 
@@ -250,11 +245,16 @@ async def phase_bootstrap(count: int, env: dict) -> None:
 
     console.print(f"\n[bold]Phase 2: Bootstrap {count} VMs (install OpenClaw)[/bold]")
 
+    # Collect web search API keys to deploy to each VM
+    brave_key = env.get("BRAVE_API_KEY", "")
+    jina_key = env.get("JINA_API_KEY", "")
+    tavily_key = env.get("TAVILY_API_KEY", "")
+
     async def bootstrap_vm(idx: int) -> None:
         name = vm_name(idx)
         console.print(f"  Bootstrapping {name}...")
 
-        # Step 1: Install OpenClaw (plain shell — curl/bash needs no special PATH)
+        # Step 1: Install OpenClaw
         rc, _, err = await run_async(
             ssh_cmd(
                 name,
@@ -268,10 +268,17 @@ async def phase_bootstrap(count: int, env: dict) -> None:
             console.print(f"  [red]OpenClaw install failed on {name}: {err[:200]}[/red]")
             sys.exit(1)
 
-        # Step 2: Onboard via login shell so openclaw is in PATH
-        # OpenAI keys are alphanumeric+hyphen — safe to embed without quoting issues
+        # Step 2: Onboard with OpenAI key + Brave search tool
+        env_exports = f"export OPENAI_API_KEY={openai_key}; "
+        if brave_key:
+            env_exports += f"export BRAVE_API_KEY={brave_key}; "
+        if jina_key:
+            env_exports += f"export JINA_API_KEY={jina_key}; "
+        if tavily_key:
+            env_exports += f"export TAVILY_API_KEY={tavily_key}; "
+
         onboard_cmd = (
-            f"export OPENAI_API_KEY={openai_key}; "
+            env_exports +
             "export OPENCLAW_NO_PROMPT=1; "
             "openclaw onboard --non-interactive --accept-risk --install-daemon --auth-choice openai-api-key"
         )
@@ -281,9 +288,28 @@ async def phase_bootstrap(count: int, env: dict) -> None:
             timeout=120,
         )
         if rc != 0:
-            # Non-fatal: openclaw may already be configured or onboard may prompt differently
             console.print(f"  [yellow]Onboard rc={rc} on {name} — may already be configured[/yellow]")
             console.print(f"  [dim]{err[:200]}[/dim]")
+
+        # Step 3: Deploy web search API keys to VM environment
+        if brave_key or jina_key or tavily_key:
+            env_lines = []
+            if brave_key:
+                env_lines.append(f"BRAVE_API_KEY={brave_key}")
+            if jina_key:
+                env_lines.append(f"JINA_API_KEY={jina_key}")
+            if tavily_key:
+                env_lines.append(f"TAVILY_API_KEY={tavily_key}")
+            env_content = "\\n".join(env_lines)
+            deploy_env_cmd = (
+                f'printf "{env_content}\\n" >> ~/.openclaw/.env; '
+                "sort -u -t= -k1,1 ~/.openclaw/.env -o ~/.openclaw/.env"
+            )
+            await run_async(
+                ssh_cmd(name, deploy_env_cmd, project, zone),
+                label=f"web-keys:{name}",
+                timeout=30,
+            )
 
     await asyncio.gather(*[bootstrap_vm(i) for i in range(1, count + 1)])
     console.print("[green]Bootstrap complete on all VMs.[/green]")
@@ -314,10 +340,7 @@ async def phase_plugin(count: int, env: dict) -> None:
             f"https://memclaw.net/api/install-plugin"
             f"?api_key={api_key}&fleet_id={fleet_id}&api_url={MEMCLAW_API_URL}"
         )
-        # Plugin install runs curl, which needs no special PATH
-        # Gateway restart needs openclaw in PATH → login shell
         install_plugin_cmd = f"curl -s '{install_url}' | bash"
-        restart_cmd = "openclaw gateway restart"
 
         console.print(f"  Installing MemClaw on {name} (fleet: {fleet_id})...")
         rc, _, err = await run_async(
@@ -417,8 +440,6 @@ async def phase_agents(count: int, env: dict) -> None:
                 sys.exit(1)
 
             # SCP workspaces directory to VM
-            # str(ws_root) = /tmp/XXX/workspaces  (no trailing slash)
-            # → creates ~/.openclaw/workspaces/ with agent subdirs inside
             rc, _, err = await run_async(
                 scp_cmd(str(ws_root), name, "~/.openclaw/", project, zone),
                 label=f"scp:{name}",
@@ -430,7 +451,7 @@ async def phase_agents(count: int, env: dict) -> None:
 
         console.print(f"  [green]{name}: {len(agent_ids)} workspaces deployed[/green]")
 
-        # Restart gateway so it picks up the new workspace files (not cached from prior run)
+        # Restart gateway so it picks up the new workspace files
         systemd_restart = (
             "systemctl --user restart openclaw-gateway.service 2>/dev/null || "
             "export PATH=$HOME/.npm-global/bin:$PATH; "
@@ -442,8 +463,7 @@ async def phase_agents(count: int, env: dict) -> None:
             timeout=30,
         )
 
-        # Register each agent individually with a per-command timeout
-        # (openclaw agents add can hang if gateway is slow to respond)
+        # Register each agent individually
         registered = 0
         for agent_id in agent_ids:
             add_cmd = (
@@ -462,7 +482,7 @@ async def phase_agents(count: int, env: dict) -> None:
     console.print("[green]Agent workspaces provisioned on all VMs.[/green]")
 
 
-# ─── Phase 5 — Run Tasks ──────────────────────────────────────────────────────
+# ─── Phase 5 — Run Tasks (3-wave delegation) ────────────────────────────────
 
 
 async def phase_tasks(count: int, env: dict) -> None:
@@ -471,18 +491,15 @@ async def phase_tasks(count: int, env: dict) -> None:
     api_key = env.get("MEMCLAW_API_KEY", "")
     admin_key = env.get("MEMCLAW_ADMIN_KEY", "")
 
-    console.print(f"\n[bold]Phase 5: Run agent tasks[/bold]")
+    console.print(f"\n[bold]Phase 5: Run agent tasks (3-wave delegation)[/bold]")
 
     async def run_agent_task(name: str, agent_id: str, task_prompt: str) -> None:
         console.print(f"  Running task: {name} / {agent_id}")
-        # timeout 600: kills openclaw on the remote side after 10 min so SSH closes cleanly
-        # Pass prompt via env var to avoid shell quoting complexity
-        # --timeout 1800 overrides openclaw's own 600s default; outer timeout 1800 kills the shell
         inner = f"export TASK_PROMPT={shlex.quote(task_prompt)}; timeout 1800 openclaw agent --agent {agent_id} --message \"$TASK_PROMPT\" --timeout 1800"
         rc, _, err = await run_async(
             login_ssh_cmd(name, inner, project, zone),
             label=f"{agent_id}@{name}",
-            timeout=1860,  # tasks can involve many LLM calls + memory writes
+            timeout=1860,
         )
         if rc != 0:
             console.print(f"  [yellow]Task warning for {agent_id}@{name}: {err[:150]}[/yellow]")
@@ -494,7 +511,7 @@ async def phase_tasks(count: int, env: dict) -> None:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
                     f"{MEMCLAW_API_URL}/api/memories",
-                    params={"tenant_id": config.TENANT, "limit": 500},
+                    params={"tenant_id": config.TENANT, "limit": 1000},
                     headers={"X-API-Key": api_key},
                 )
             if resp.status_code == 200:
@@ -504,9 +521,63 @@ async def phase_tasks(count: int, env: dict) -> None:
         except Exception:
             pass
 
-    # Step 1: Run all non-nexus agents in parallel (by fleet), skip already done
-    console.print("\n  [dim]Running non-nexus agents across all fleets...[/dim]")
-    non_nexus_coros = []
+    # ── Wave 1: NEXUS writes delegation task memories to target fleets ────
+    nexus_vm_entry = next((vf for vf in _VM_FLEETS if "nexus" in vf["agents"]), None)
+    if nexus_vm_entry and nexus_vm_entry["vm_index"] <= count:
+        nexus_vm = vm_name(nexus_vm_entry["vm_index"])
+        nexus_fleet = nexus_vm_entry["fleet_id"]
+
+        if (nexus_fleet, "nexus") not in already_wrote:
+            console.print("\n  [bold]Wave 1: NEXUS bootstrap + delegation[/bold]")
+
+            # Bootstrap NEXUS
+            bootstrap_prompt = (
+                "Store this initialization memory: "
+                "NEXUS master orchestrator is online and initializing cross-fleet coordination for v2 "
+                "(10 VMs, 50 agents). Delegation wave beginning."
+            )
+            await run_agent_task(nexus_vm, "nexus", bootstrap_prompt)
+
+            # Promote nexus trust to level 3 (cross-fleet reads AND writes)
+            auth_key = admin_key or api_key
+            if auth_key:
+                console.print("  [dim]Promoting NEXUS to trust level 3 (cross-fleet read+write)...[/dim]")
+                try:
+                    async with httpx.AsyncClient(timeout=15) as client:
+                        resp = await client.patch(
+                            f"{MEMCLAW_API_URL}/api/agents/nexus/trust",
+                            params={"tenant_id": config.TENANT},
+                            json={"trust_level": 3},
+                            headers={"X-API-Key": auth_key},
+                        )
+                    if resp.status_code == 200:
+                        console.print("  [green]NEXUS trust level promoted to 3[/green]")
+                    else:
+                        console.print(
+                            f"  [yellow]Trust promotion returned {resp.status_code}: {resp.text[:100]}[/yellow]"
+                        )
+                except Exception as exc:
+                    console.print(f"  [yellow]Trust promotion error: {exc}[/yellow]")
+
+            # NEXUS writes delegation task memories to its own fleet
+            # (other agents see them via cross-fleet recall)
+            delegation_prompt = (
+                "Store the following delegation task memories in YOUR fleet (use your own fleet_id). "
+                "Other fleets will see them via cross-fleet recall. "
+                "Store each as a separate task memory with 'NEXUS delegation' prefix: "
+                "1. 'NEXUS delegation to Engineering (fleet-02): Produce architecture review for payment gateway. Coordinate ADRs and system design.' "
+                "2. 'NEXUS delegation to Research (fleet-04): Research current AI infrastructure trends using web search tools. Store findings with source URLs.' "
+                "3. 'NEXUS delegation to Finance (fleet-05): Prepare Q2 budget forecast with detailed assumptions and line items.' "
+                "4. 'NEXUS delegation to Intelligence (fleet-09): Analyze competitor pricing via web search. Focus on Stripe, Square, Adyen.' "
+            )
+            await run_agent_task(nexus_vm, "nexus", delegation_prompt)
+            already_wrote.add((nexus_fleet, "nexus"))
+        else:
+            console.print("  [dim]NEXUS already has memories — skipping Wave 1[/dim]")
+
+    # ── Wave 2: All fleet agents run in parallel ─────────────────────────
+    console.print("\n  [bold]Wave 2: All fleet agents run in parallel[/bold]")
+    wave2_coros = []
     for vf in _VM_FLEETS:
         idx = vf["vm_index"]
         if idx > count:
@@ -519,50 +590,27 @@ async def phase_tasks(count: int, env: dict) -> None:
                 console.print(f"  [dim]Skip {agent_id}@{vf['fleet_id']} — already has memories[/dim]")
                 continue
             task_prompt = TASKS.get(agent_id, "Recall your context and summarize your current status.")
-            non_nexus_coros.append(run_agent_task(name, agent_id, task_prompt))
+            wave2_coros.append(run_agent_task(name, agent_id, task_prompt))
 
-    if non_nexus_coros:
-        await asyncio.gather(*non_nexus_coros)
+    if wave2_coros:
+        await asyncio.gather(*wave2_coros)
     else:
-        console.print("  [dim]All non-nexus agents already wrote memories.[/dim]")
+        console.print("  [dim]All wave-2 agents already wrote memories.[/dim]")
 
-    # Step 2: Bootstrap nexus (registers it in MemClaw on first write)
-    nexus_vm_entry = next((vf for vf in _VM_FLEETS if "nexus" in vf["agents"]), None)
+    # ── Wave 3: NEXUS cross-fleet synthesis ──────────────────────────────
     if nexus_vm_entry and nexus_vm_entry["vm_index"] <= count:
-        nexus_vm = vm_name(nexus_vm_entry["vm_index"])
-        console.print("\n  [dim]Registering NEXUS agent...[/dim]")
-        bootstrap_prompt = (
-            "Store this initialization memory: "
-            "NEXUS master orchestrator is online and initializing cross-fleet coordination."
+        console.print("\n  [bold]Wave 3: NEXUS cross-fleet synthesis[/bold]")
+        synthesis_prompt = (
+            "Recall ALL work across ALL fleets (omit fleet_id for org-wide recall). "
+            "Synthesize a comprehensive cross-fleet status report covering: "
+            "1. Engineering progress (fleet-02) "
+            "2. Research findings (fleet-04) "
+            "3. Financial projections (fleet-05) "
+            "4. Competitive intelligence (fleet-09) "
+            "5. Any blockers or cross-fleet dependencies. "
+            "Store the synthesis as a plan memory."
         )
-        await run_agent_task(nexus_vm, "nexus", bootstrap_prompt)
-
-        # Step 3: Promote nexus trust to level 2 (cross-fleet reads)
-        auth_key = admin_key or api_key
-        if auth_key:
-            console.print("  [dim]Promoting NEXUS to trust level 2 (cross-fleet)...[/dim]")
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    resp = await client.patch(
-                        f"{MEMCLAW_API_URL}/api/agents/nexus/trust",
-                        params={"tenant_id": config.TENANT},
-                        json={"trust_level": 2},
-                        headers={"X-API-Key": auth_key},
-                    )
-                if resp.status_code == 200:
-                    console.print("  [green]NEXUS trust level promoted to 2[/green]")
-                else:
-                    console.print(
-                        f"  [yellow]Trust promotion returned {resp.status_code}: {resp.text[:100]}[/yellow]"
-                    )
-            except Exception as exc:
-                console.print(f"  [yellow]Trust promotion error: {exc}[/yellow]")
-        else:
-            console.print("  [yellow]No API key available — skipping NEXUS trust promotion[/yellow]")
-
-        # Step 4: Run nexus's cross-fleet task
-        console.print("\n  [dim]Running NEXUS cross-fleet recall task...[/dim]")
-        await run_agent_task(nexus_vm, "nexus", TASKS["nexus"])
+        await run_agent_task(vm_name(nexus_vm_entry["vm_index"]), "nexus", synthesis_prompt)
 
     console.print("[green]All agent tasks complete.[/green]")
 
@@ -637,7 +685,7 @@ def interactive_menu(env: dict, count: int) -> None:
     project = env.get("GCP_PROJECT", GCP_PROJECT)
     zone = env.get("GCP_ZONE", GCP_ZONE)
 
-    console.print("\n[bold cyan]OpenClaw Fleet Tester — Interactive Mode[/bold cyan]")
+    console.print("\n[bold cyan]OpenClaw Fleet Tester v2 — Interactive Mode[/bold cyan]")
     console.print(f"  VMs: {', '.join(vm_name(i) for i in range(1, count + 1))}\n")
 
     choices = {
@@ -723,7 +771,7 @@ def _interactive_single_task(env: dict, count: int, project: str, zone: str) -> 
     console.print("\n  Available agents:")
     for i, (vm, fid, aid) in enumerate(options, 1):
         default_task = TASKS.get(aid, "")[:60]
-        console.print(f"  [{i:2d}] {aid:<20} ({fid}) — {default_task}…")
+        console.print(f"  [{i:2d}] {aid:<24} ({fid}) — {default_task}…")
 
     idx = int(Prompt.ask("  Agent number", default="1")) - 1
     if idx < 0 or idx >= len(options):
@@ -765,7 +813,7 @@ def phase_fns_map() -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="OpenClaw Fleet Memory Test Orchestrator",
+        description="OpenClaw Fleet Memory Test v2 Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n".join([
             "Phases: " + ", ".join(PHASES_ORDERED),
@@ -774,7 +822,7 @@ def main() -> None:
             "  bootstrap — install OpenClaw on each VM",
             "  plugin    — install MemClaw plugin per VM",
             "  agents    — provision agent workspaces",
-            "  tasks     — run agent tasks",
+            "  tasks     — run agent tasks (3-wave delegation)",
             "  verify    — verify memory storage",
             "  teardown  — delete GCP VMs",
         ]),
@@ -819,11 +867,11 @@ def main() -> None:
     else:
         count = int(env.get("VM_COUNT", str(VM_COUNT_DEFAULT)))
 
-    if count < 1 or count > 10:
-        console.print(f"[red]VM count must be 1–10, got {count}[/red]")
+    if count < 1 or count > 20:
+        console.print(f"[red]VM count must be 1–20, got {count}[/red]")
         sys.exit(1)
 
-    console.print(f"\n[bold cyan]OpenClaw Fleet Memory Test[/bold cyan]")
+    console.print(f"\n[bold cyan]OpenClaw Fleet Memory Test v2[/bold cyan]")
     console.print(f"  Tenant:  {config.TENANT}")
     console.print(f"  Prefix:  {user_prefix or '(none)'}")
     console.print(f"  VM name: {vm_name(1)} … {vm_name(count)}")
