@@ -87,6 +87,9 @@ def make_vm_fleets(user_prefix: str) -> list[dict]:
 # Default VM_FLEETS (no prefix) — overridden at runtime by orchestrate.py
 VM_FLEETS = make_vm_fleets("")
 
+# Agent used to verify trust-level enforcement (must be trust level 1, i.e. NOT nexus)
+TRUST_DENIED_AGENT = "eng-architect"
+
 # ─── Agent Definitions ────────────────────────────────────────────────────────
 
 AGENT_DEFS: dict[str, dict] = {
